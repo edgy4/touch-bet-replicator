@@ -1,80 +1,115 @@
 import pandas as pd
+import numpy as np
+from datetime import datetime
 from deribit_connector import DeribitConnector
 from polymarket_touch_scanner import PolymarketTouchScanner
+from bs_models import BlackScholesModels
 
 class TouchReplicator:
+    """
+    Replicates Polymarket 'Touch' bets using Deribit Option Chains.
+    Implements methodologies from Dimitris Andreou (Spread Replication)
+    and Black-Scholes (Analytical).
+    """
+    
     def __init__(self):
         self.poly_scanner = PolymarketTouchScanner()
         self.deribit = DeribitConnector("BTC")
         self.option_chain = pd.DataFrame()
+        self.risk_free_rate = 0.04 # Estimating 4% risk free rate
 
-    def calculate_synthetic_prob(self, strike, expiry):
+    def get_time_to_expiry(self, expiry_str):
+        """Calculate years to expiry"""
+        try:
+            exp_date = datetime.strptime(expiry_str, "%Y-%m-%d")
+            delta = exp_date - datetime.now()
+            return max(0.001, delta.days / 365.0)
+        except:
+            return 0.0
+
+    def calculate_deribit_metrics(self, strike, expiry, poly_type="Up"):
         """
-        Calculate implied probability of touch using Deribit Credit Spreads.
-        Strategy: Sell Call(K) / Buy Call(K+Width).
+        Calculate implied probabilities using Deribit data.
+        Returns: { 'bs_prob': float, 'spread_prob': float, 'details': dict }
         """
         if self.option_chain.empty: return None
 
-        # Filter for relevant expiration (>= Poly expiry)
-        relevant_opts = self.option_chain[self.option_chain["expiry"] >= expiry]
+        # Filter for relevant expiry
+        relevant_opts = self.option_chain[self.option_chain["expiry"] >= expiry].sort_values("expiry")
         if relevant_opts.empty: return None
         
-        relevant_opts = relevant_opts.sort_values("expiry")
         target_expiry = relevant_opts.iloc[0]["expiry"]
-        
         chain = relevant_opts[relevant_opts["expiry"] == target_expiry]
         
-        # Find Call options for Credit Spread (Short K, Long K+Width)
+        # Get Spot Price (Index)
+        spot = chain.iloc[0]["underlying_price"]
+        if not spot: return None
+        
+        # 1. Analytical Black-Scholes Probability
+        # Need Implied Volatility at the Strike
+        # Find option closest to strike
+        
+        # If Target > Spot (Call side)
+        target_opt = chain.iloc[(chain['strike'] - strike).abs().argsort()[:1]]
+        if target_opt.empty: return None
+        
+        iv = target_opt.iloc[0]["mark_iv"] / 100.0 # Convert to decimal
+        T = self.get_time_to_expiry(target_expiry)
+        
+        bs_prob = BlackScholesModels.one_touch_probability(
+            S=spot, K=strike, T=T, sigma=iv, r=self.risk_free_rate
+        )
+        
+        # 2. Spread Replication (Andreou Method)
+        # Construct Vertical Credit Spread centered around K (or just above/below)
+        # Andreou: "Vertical Spread Value at Touch ~ 50% of Width"
+        # Strategy: Sell Spread (Credit).
+        # Implied Prob = 2 * Credit / Width
+        
+        # Find strikes for spread: [K-1000, K+1000] if possible, or closest
         calls = chain[chain["type"] == "call"].sort_values("strike")
         
-        # Find strike closest to K
-        candidates = calls[calls["strike"] >= strike]
-        if candidates.empty: return None
+        # Find strike just below and just above K
+        lower_candidates = calls[calls["strike"] <= strike]
+        upper_candidates = calls[calls["strike"] > strike]
         
-        short_leg = candidates.iloc[0] # Sell this (Strike K)
+        if lower_candidates.empty or upper_candidates.empty:
+            return {"bs_prob": bs_prob, "spread_prob": None, "details": {"iv": iv, "T": T}}
+            
+        short_leg = lower_candidates.iloc[-1] # Sell (Bid)
+        long_leg = upper_candidates.iloc[0]   # Buy (Ask)
+        
         k_short = short_leg["strike"]
-        
-        # Find long leg (next strike up)
-        long_candidates = calls[calls["strike"] > k_short]
-        if long_candidates.empty: return None
-        
-        long_leg = long_candidates.iloc[0] # Buy this (Strike K+Width)
         k_long = long_leg["strike"]
         
-        # Calculate Credit Received (Premium)
-        # Sell Bid (conservative), Buy Ask (conservative)
-        # Wait. To open a credit spread, we Sell (Bid) and Buy (Ask).
-        # We want to receive credit.
-        
-        p_short = short_leg["bid"] # Selling
-        p_long = long_leg["ask"]   # Buying
-        
-        if pd.isna(p_short) or pd.isna(p_long): return None
-        
-        # Underlying Price (Index)
-        index_price = short_leg["underlying_price"]
-        
-        credit_btc = p_short - p_long
-        credit_usd = credit_btc * index_price
-        
+        # Check liquidity
+        if pd.isna(short_leg["bid"]) or pd.isna(long_leg["ask"]):
+             return {"bs_prob": bs_prob, "spread_prob": None, "details": {"iv": iv, "T": T}}
+
+        # Credit Calculation (BTC -> USD)
+        credit_btc = short_leg["bid"] - long_leg["ask"]
+        credit_usd = credit_btc * spot
         width = k_long - k_short
         
-        if credit_usd <= 0: return None # No credit (or negative due to spread)
-        
-        # Implied Touch Probability (Dimitris Andreou Formula)
-        # P(Touch) = 2 * Premium / Width
-        
-        prob_touch = (2 * credit_usd) / width
-        
+        spread_prob = 0.0
+        if width > 0 and credit_usd > 0:
+            # Formula: P = 2 * Credit / Width
+            spread_prob = (2 * credit_usd) / width
+            
         return {
-            "prob": prob_touch,
-            "credit": credit_usd,
-            "width": width,
-            "spread": f"{k_short}-{k_long}",
-            "expiry": target_expiry
+            "bs_prob": bs_prob,
+            "spread_prob": spread_prob,
+            "details": {
+                "iv": iv, 
+                "T": T, 
+                "spread": f"{k_short}-{k_long}",
+                "credit": credit_usd,
+                "spot": spot
+            }
         }
 
     def scan(self):
+        print("=== Touch Bet Replicator (v2.0) ===")
         print("Fetching Deribit Data...")
         self.option_chain = self.deribit.get_option_chain_summary()
         
@@ -83,54 +118,48 @@ class TouchReplicator:
         
         opportunities = []
         
+        print(f"\nScanning {len(poly_markets)} Markets...\n")
+        
         for m in poly_markets:
             details = self.poly_scanner.parse_market_details(m)
             if not details: continue
             
             strike = details["strike"]
-            expiry = details["expiry"]
-            poly_price = details["poly_price"] # P(Touch) according to Poly
+            poly_prob = details["poly_price"]
             
-            # Skip if expiry is too far (Deribit liquidity issues)
-            # or too close (< 1 day)
+            # Skip expired
+            if details["expiry"] < datetime.now().strftime("%Y-%m-%d"): continue
+
+            metrics = self.calculate_deribit_metrics(strike, details["expiry"])
+            if not metrics: continue
             
-            deribit_data = self.calculate_synthetic_prob(strike, expiry)
+            bs_prob = metrics["bs_prob"]
+            spread_prob = metrics["spread_prob"]
             
-            if not deribit_data: continue
+            # Comparison Logic
+            # If Poly > Models => Buy NO
+            # If Poly < Models => Buy YES (Rare)
             
-            deribit_prob = deribit_data["prob"]
+            # Use Spread Prob as the "Execution" benchmark
+            # Use BS Prob as the "Theoretical" benchmark
             
-            # Comparison
-            # If Poly Price (Implied Prob) > Deribit Prob + Edge:
-            # Poly thinks touch is MORE likely than Deribit.
-            # "No Touch" on Poly is cheap.
-            # Strategy: Buy "No" on Poly.
+            ref_prob = spread_prob if spread_prob else bs_prob
+            diff = poly_prob - ref_prob
             
-            diff = poly_price - deribit_prob
-            
+            # Display
             print(f"Market: {details['question']}")
-            print(f"  Poly P(Touch): {poly_price:.2%}")
-            print(f"  Deribit P(Touch): {deribit_prob:.2%} (Credit: ${deribit_data['credit']:.2f}, Width: ${deribit_data['width']:.0f})")
-            print(f"  Diff: {diff*100:.1f}%")
+            print(f"  Expiry: {details['expiry']} | Strike: {strike}")
+            print(f"  Polymarket: {poly_prob:.1%}")
+            print(f"  Deribit BS: {bs_prob:.1%} (IV: {metrics['details']['iv']:.1%})")
+            if spread_prob:
+                print(f"  Deribit Spread: {spread_prob:.1%} (Spread: {metrics['details']['spread']})")
+            print(f"  Edge: {diff*100:.1f}%")
             
-            if diff > 0.10: # 10% edge
-                opportunities.append({
-                    "question": details["question"],
-                    "strike": strike,
-                    "poly_prob": poly_price,
-                    "deribit_prob": deribit_prob,
-                    "edge": diff,
-                    "action": "BUY NO (Polymarket)",
-                    "spread": deribit_data["spread"]
-                })
+            if diff > 0.10:
+                print("  >>> SIGNAL: BUY NO (Overpriced)")
+                opportunities.append(details)
             
-            print("-" * 40)
-            
-        print(f"\nFound {len(opportunities)} High-Conviction Opportunities:")
-        for op in opportunities:
-            print(f"[{op['action']}] {op['question']}")
-            print(f"  Edge: {op['edge']*100:.1f}% (Poly: {op['poly_prob']:.0%} vs Deribit: {op['deribit_prob']:.0%})")
-            print(f"  Ref Spread: {op['spread']}")
+            print("-" * 30)
 
 if __name__ == "__main__":
     scanner = TouchReplicator()

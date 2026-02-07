@@ -35,7 +35,7 @@ class PolymarketTouchScanner:
                 markets.extend(batch)
                 offset += limit
                 print(f"Fetched {len(markets)} markets...", end='\r')
-                if len(markets) >= 2000: break # Limit to 2000 for now to save time
+                if len(markets) >= 3000: break # Increased limit for long-tail
             except Exception as e:
                 print(f"Error fetching Polymarket: {e}")
                 break
@@ -45,8 +45,11 @@ class PolymarketTouchScanner:
         touch_markets = []
         for m in markets:
             question = m.get("question", "")
-            # Broader filter for Touch/Price markets
-            if ("BTC" in question or "Bitcoin" in question) and ("hit" in question or "reach" in question or "above" in question):
+            # Filter for "What price will Bitcoin hit in February 2026?"
+            if "What price will Bitcoin hit in February 2026?" in question:
+                touch_markets.append(m)
+            # Or general pattern
+            elif ("BTC" in question or "Bitcoin" in question) and ("hit" in question or "reach" in question or "above" in question):
                 touch_markets.append(m)
         
         return touch_markets
@@ -57,13 +60,25 @@ class PolymarketTouchScanner:
         description = market.get("description", "")
         end_date_iso = market.get("endDate") # ISO format: 2024-02-29T23:59:00Z
         
-        # Extract Strike Price
-        # "Will BTC hit $100,000 in 2024?"
+        # Default strike parsing for "Will BTC hit $X"
         strike_match = re.search(r'\$([\d,]+)', question)
-        if not strike_match:
-            return None
+        strike = float(strike_match.group(1).replace(",", "")) if strike_match else None
         
-        strike = float(strike_match.group(1).replace(",", ""))
+        # Special parsing for "What price will Bitcoin hit in February 2026?"
+        # The market might be a Group market where outcomes are strikes ($100k, $120k).
+        # OR it might be individual markets: "Will Bitcoin hit $100k in Feb 2026?"
+        # The user linked a Group market. Polymarket API returns Group markets differently.
+        # If it's a Group Market, outcomes might be ["$100k", "$120k", "No Touch"].
+        # But usually Group Markets are split into individual "Binary Markets" in the API list.
+        # So we might see "Will Bitcoin hit $100k in Feb 2026?" as a separate item.
+        
+        # Let's check if the strike is in the outcome name if not in question
+        if strike is None:
+             # Check outcomes
+             pass
+
+        if not strike:
+            return None
         
         # Extract Expiry Date
         if end_date_iso:
@@ -75,10 +90,9 @@ class PolymarketTouchScanner:
             return None
 
         # Get Current Price of "Yes"
-        # outcomePrices is a JSON string list: ["0.15", "0.85"]
         try:
             prices = eval(market.get("outcomePrices", "[]"))
-            yes_price = float(prices[0]) # Assuming Yes is first (usually is)
+            yes_price = float(prices[0]) # Assuming Yes is first
         except:
             yes_price = 0.0
 
