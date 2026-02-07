@@ -183,12 +183,17 @@ class TouchReplicator:
                 .card { background: white; padding: 15px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
                 .signal { color: green; font-weight: bold; }
                 .metric { margin: 5px 0; }
-                .btn { display: inline-block; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; }
+                .btn { display: inline-block; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+                .instructions { margin-top: 15px; padding: 10px; background-color: #f9f9f9; border-left: 3px solid #ccc; }
+                .instructions h4 { margin-top: 0; color: #444; }
+                ol { padding-left: 20px; }
+                li { margin-bottom: 8px; }
             </style>
         </head>
         <body>
             <h1>Touch Bet Arbitrage Scanner</h1>
             <p>Last Updated: """ + datetime.now().strftime("%Y-%m-%d %H:%M UTC") + """</p>
+            <p><em>Signals appear when Polymarket 'Yes' probability significantly exceeds Deribit's implied 'Touch' probability (via spread replication).</em></p>
         """
         
         # Sort by edge descending
@@ -198,14 +203,60 @@ class TouchReplicator:
             if r["edge"] < 0.05: continue # Filter noise
             
             signal_color = "green" if r["edge"] > 0.1 else "orange"
+            
+            # Generate specific instructions for this market
+            # Assume it's an "Up" bet for now (e.g., "Will BTC hit $X?")
+            # Extract strike and expiry for instructions
+            strike_str = f"${r['strike']:,.0f}"
+            expiry_str = r['expiry']
+            
+            # Determine hedge spread legs based on the output format
+            spread_detail = r['spread_details']
+            hedge_legs = "N/A"
+            leg1 = "N/A"
+            leg2 = "N/A"
+            if spread_detail != "N/A":
+                # Parse the spread detail string (e.g., "70000.0-71000.0") to get hedge strikes
+                try:
+                    legs = spread_detail.split('-')
+                    if len(legs) == 2:
+                        leg1 = f"${float(legs[0]):,.0f}"
+                        leg2 = f"${float(legs[1]):,.0f}"
+                        hedge_legs = f"Sell Call @{leg1}, Buy Call @{leg2}"
+                except:
+                    pass # If parsing fails, leave as N/A
+            
             html += f"""
             <div class="card" style="border-left: 5px solid {signal_color}">
                 <h3>{r['market']}</h3>
                 <div class="metric"><b>Edge:</b> <span style="color:{signal_color}">{r['edge']*100:.1f}%</span></div>
                 <div class="metric">Polymarket (Yes): {r['poly_prob']:.1%} | Deribit (Implied): {r['spread_prob'] if r['spread_prob'] else r['bs_prob']:.1%}</div>
-                <div class="metric">Strike: ${r['strike']:,} | Expiry: {r['expiry']}</div>
+                <div class="metric">Strike: {strike_str} | Expiry: {expiry_str}</div>
                 <div class="metric">Reference Spread: {r['spread_details']}</div>
-                <br>
+                
+                <div class="instructions">
+                    <h4>How to Execute:</h4>
+                    <strong>1. Polymarket (Go Short 'Touch'):</strong>
+                    <ol>
+                        <li>Navigate to the market: <a href="{r['url']}" target="_blank">View on Polymarket</a>.</li>
+                        <li>Confirm the event details match: <em>{r['market']}</em> (Strike: {strike_str}, Expiry: {expiry_str}).</li>
+                        <li>Connect your wallet and ensure you have sufficient USDC.</li>
+                        <li>Find the <strong>'NO'</strong> outcome.</li>
+                        <li>Place an order to <strong>Buy 'NO' shares</strong>. The price reflects the {r['poly_prob']:.1%} probability.</li>
+                    </ol>
+                    
+                    <strong>2. Deribit Hedge (Cover Touch Risk):</strong>
+                    <ol>
+                        <li>Log in to Deribit.</li>
+                        <li>Go to the BTC Options chain expiring on or before {expiry_str}.</li>
+                        <li>Identify the hedge spread: <strong>{hedge_legs}</strong>. This replicates the 'No Touch' payoff.</li>
+                        <li>Place a <strong>Sell Order for the {leg1} Call</strong>.</li>
+                        <li>Place a <strong>Buy Order for the {leg2} Call</strong> (same number of contracts).</li>
+                        <li><em>(Preferred):</em> Use a 'Vertical Spread' order type if available, selecting the {leg1} (short) and {leg2} (long) legs. This ensures simultaneous execution.</li>
+                        <li>Ensure adequate BTC collateral for the short call option.</li>
+                    </ol>
+                </div>
+                
                 <a href="{r['url']}" class="btn" target="_blank">View Market</a>
             </div>
             """
@@ -221,3 +272,4 @@ if __name__ == "__main__":
     scanner = TouchReplicator()
     html_mode = "--html" in sys.argv
     scanner.scan(html_output=html_mode)
+
