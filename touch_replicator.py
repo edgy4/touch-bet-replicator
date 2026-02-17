@@ -46,9 +46,6 @@ class TouchReplicator:
         if not spot: return None
         
         # 1. Analytical Black-Scholes Probability
-        # Need Implied Volatility at the Strike
-        # Find option closest to strike
-        
         # If Target > Spot (Call side)
         target_opt = chain.iloc[(chain['strike'] - strike).abs().argsort()[:1]]
         if target_opt.empty: return None
@@ -61,12 +58,6 @@ class TouchReplicator:
         )
         
         # 2. Spread Replication (Andreou Method)
-        # Construct Vertical Credit Spread centered around K (or just above/below)
-        # Andreou: "Vertical Spread Value at Touch ~ 50% of Width"
-        # Strategy: Sell Spread (Credit).
-        # Implied Prob = 2 * Credit / Width
-        
-        # Find strikes for spread: [K-1000, K+1000] if possible, or closest
         calls = chain[chain["type"] == "call"].sort_values("strike")
         
         # Find strike just below and just above K
@@ -82,18 +73,15 @@ class TouchReplicator:
         k_short = short_leg["strike"]
         k_long = long_leg["strike"]
         
-        # Check liquidity
         if pd.isna(short_leg["bid"]) or pd.isna(long_leg["ask"]):
              return {"bs_prob": bs_prob, "spread_prob": None, "details": {"iv": iv, "T": T}}
 
-        # Credit Calculation (BTC -> USD)
         credit_btc = short_leg["bid"] - long_leg["ask"]
         credit_usd = credit_btc * spot
         width = k_long - k_short
         
         spread_prob = 0.0
         if width > 0 and credit_usd > 0:
-            # Formula: P = 2 * Credit / Width
             spread_prob = (2 * credit_usd) / width
             
         return {
@@ -116,7 +104,6 @@ class TouchReplicator:
         print("Fetching Polymarket Data...")
         poly_markets = self.poly_scanner.fetch_polymarket_touch_markets()
         
-        opportunities = []
         scan_results = []
         
         print(f"\nScanning {len(poly_markets)} Markets...\n")
@@ -152,19 +139,22 @@ class TouchReplicator:
                 "spread_details": metrics['details']['spread'] if spread_prob else "N/A"
             }
             scan_results.append(result_item)
+
+        # --- SORTING BY EDGE DESCENDING ---
+        scan_results.sort(key=lambda x: x["edge"], reverse=True)
+
+        # Print sorted results to terminal
+        for r in scan_results:
+            print(f"Market: {r['market']}")
+            print(f"  Expiry: {r['expiry']} | Strike: {r['strike']}")
+            print(f"  Polymarket: {r['poly_prob']:.1%}")
+            print(f"  Deribit BS: {r['bs_prob']:.1%} (IV: {r['iv']:.1%})")
+            if r['spread_prob']:
+                print(f"  Deribit Spread: {r['spread_prob']:.1%} (Spread: {r['spread_details']})")
+            print(f"  Edge: {r['edge']*100:.1f}%")
             
-            print(f"Market: {details['question']}")
-            print(f"  Expiry: {details['expiry']} | Strike: {strike}")
-            print(f"  Polymarket: {poly_prob:.1%}")
-            print(f"  Deribit BS: {bs_prob:.1%} (IV: {metrics['details']['iv']:.1%})")
-            if spread_prob:
-                print(f"  Deribit Spread: {spread_prob:.1%} (Spread: {metrics['details']['spread']})")
-            print(f"  Edge: {diff*100:.1f}%")
-            
-            if diff > 0.10:
+            if r['edge'] > 0.10:
                 print("  >>> SIGNAL: BUY NO (Overpriced)")
-                opportunities.append(result_item)
-            
             print("-" * 30)
             
         if html_output:
@@ -187,98 +177,4 @@ class TouchReplicator:
                 .btn { display: inline-block; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; margin-top: 10px; }
                 .instructions { margin-top: 15px; padding: 10px; background-color: #f9f9f9; border-left: 3px solid #ccc; }
                 .instructions h4 { margin-top: 0; color: #444; }
-                .risk-warning { color: red; font-weight: bold; margin-top: 10px; }
-                ol { padding-left: 20px; }
-                li { margin-bottom: 8px; }
-            </style>
-        </head>
-        <body>
-            <h1>Touch Bet Arbitrage Scanner</h1>
-            <div class="disclaimer">
-                <strong>DISCLAIMER:</strong> This tool provides information only, not investment advice. Cryptocurrency and derivatives trading involve substantial risk. Past performance does not guarantee future results. Do not invest more than you can afford to lose. Consult a qualified financial advisor before making investment decisions. No representation is made regarding the profitability of any strategy. <em>This is Haram.</em>
-            </div>
-            <p>Last Updated: """ + datetime.now().strftime("%Y-%m-%d %H:%M UTC") + """</p>
-            <p><em>Signals appear when Polymarket 'Yes' probability significantly exceeds Deribit's implied 'Touch' probability (via spread replication).</em></p>
-        """
-        
-        # Sort by edge descending
-        results.sort(key=lambda x: x["edge"], reverse=True)
-        
-        for r in results:
-            if r["edge"] < 0.05: continue # Filter noise
-            
-            signal_color = "green" if r["edge"] > 0.1 else "orange"
-            
-            # Generate specific instructions for this market
-            # Assume it's an "Up" bet for now (e.g., "Will BTC hit $X?")
-            # Extract strike and expiry for instructions
-            strike_str = f"${r['strike']:,.0f}"
-            expiry_str = r['expiry']
-            
-            # Determine hedge spread legs based on the output format
-            spread_detail = r['spread_details']
-            hedge_legs = "N/A"
-            leg1 = "N/A"
-            leg2 = "N/A"
-            if spread_detail != "N/A":
-                # Parse the spread detail string (e.g., "70000.0-71000.0") to get hedge strikes
-                try:
-                    legs = spread_detail.split('-')
-                    if len(legs) == 2:
-                        leg1 = f"${float(legs[0]):,.0f}"
-                        leg2 = f"${float(legs[1]):,.0f}"
-                        hedge_legs = f"Sell Call @{leg1}, Buy Call @{leg2}"
-                except:
-                    pass # If parsing fails, leave as N/A
-            
-            html += f"""
-            <div class="card" style="border-left: 5px solid {signal_color}">
-                <h3>{r['market']}</h3>
-                <div class="metric"><b>Edge:</b> <span style="color:{signal_color}">{r['edge']*100:.1f}%</span></div>
-                <div class="metric">Polymarket (Yes): {r['poly_prob']:.1%} | Deribit (Implied): {r['spread_prob'] if r['spread_prob'] else r['bs_prob']:.1%}</div>
-                <div class="metric">Strike: {strike_str} | Expiry: {expiry_str}</div>
-                <div class="metric">Reference Spread: {r['spread_details']}</div>
-                
-                <div class="instructions">
-                    <h4>How to Execute:</h4>
-                    <strong>1. Polymarket (Go Short 'Touch'):</strong>
-                    <ol>
-                        <li>Navigate to the market: <a href="{r['url']}" target="_blank">View on Polymarket</a>.</li>
-                        <li>Confirm the event details match: <em>{r['market']}</em> (Strike: {strike_str}, Expiry: {expiry_str}).</li>
-                        <li>Connect your wallet and ensure you have sufficient USDC.</li>
-                        <li>Find the <strong>'NO'</strong> outcome.</li>
-                        <li>Place an order to <strong>Buy 'NO' shares</strong>. The price reflects the {r['poly_prob']:.1%} probability.</li>
-                    </ol>
-                    
-                    <strong>2. Deribit Hedge (Cover Touch Risk):</strong>
-                    <ol>
-                        <li>Log in to Deribit.</li>
-                        <li>Go to the BTC Options chain expiring on or before {expiry_str}.</li>
-                        <li>Identify the hedge spread: <strong>{hedge_legs}</strong>. This replicates the 'No Touch' payoff.</li>
-                        <li>Place a <strong>Sell Order for the {leg1} Call</strong>.</li>
-                        <li>Place a <strong>Buy Order for the {leg2} Call</strong> (same number of contracts).</li>
-                        <li><em>(Preferred):</em> Use a 'Vertical Spread' order type if available, selecting the {leg1} (short) and {leg2} (long) legs. This ensures simultaneous execution.</li>
-                        <li>Ensure adequate BTC collateral for the short call option.</li>
-                    </ol>
-                </div>
-                
-                <div class="risk-warning">
-                    <strong>RISK WARNING:</strong> Options trading and crypto markets are highly risky. This is not financial advice. Trade at your own risk.
-                </div>
-                
-                <a href="{r['url']}" class="btn" target="_blank">View Market</a>
-            </div>
-            """
-            
-        html += "</body></html>"
-        
-        with open("index.html", "w") as f:
-            f.write(html)
-        print("Generated index.html")
-
-if __name__ == "__main__":
-    import sys
-    scanner = TouchReplicator()
-    html_mode = "--html" in sys.argv
-    scanner.scan(html_output=html_mode)
-
+                .risk-warning
